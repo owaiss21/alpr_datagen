@@ -1,0 +1,15 @@
+How to run (camera / RTSP / video file)
+
+Cars (USB cam index 0):
+
+python edge_capture.py --mode cars --source 0 --out ./data/cars
+
+
+People (RTSP):
+
+python edge_capture.py --mode people --source rtsp://user:pass@cam-ip/stream1 --out ./data/people
+
+
+Cars (local video file):
+
+python edge_capture.py --mode cars --source ./samples/driveway_20240807.mp4 --out ./data/cars
