@@ -13,3 +13,6 @@ python edge_capture.py --mode people --source rtsp://user:pass@cam-ip/stream1 --
 Cars (local video file):
 
 python edge_capture.py --mode cars --source ./samples/driveway_20240807.mp4 --out ./data/cars
+
+Two cameras at once (example: indices 0 and 1):
+python edge_capture.py --mode cars --source 0 --source 1 --out ./data/cars

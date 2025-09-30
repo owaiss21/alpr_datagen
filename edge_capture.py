@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from collections import deque, defaultdict
 from datetime import datetime
+import re
 
 import cv2
 import numpy as np
@@ -27,6 +28,10 @@ DEFAULT_WEIGHTS = "yolov8n.pt"
 
 STOP_EVENT = threading.Event()
 
+def str2bool(v: str) -> bool:
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() not in {"false", "0", "no", "off"}
 
 # ---------------------------
 # Utils
@@ -39,7 +44,7 @@ def timestamp_slug():
     return now.strftime("%Y-%m-%d_%H-%M-%S_") + f"{int(now.microsecond/1000):03d}"
 
 def build_outdir(base: Path):
-    # CHANGED: single daily folder YYYY_MM_DD (was nested YYYY/MM/DD)
+    # single daily folder YYYY_MM_DD
     now = datetime.now()
     day = f"{now.year:04d}_{now.month:02d}_{now.day:02d}"
     outdir = base / day
@@ -66,6 +71,24 @@ def normalize_source(src: str):
     if src.isdigit() and not Path(src).exists():
         return int(src)
     return src
+
+def make_source_tag(src) -> str:
+    """
+    Short, safe tag for filenames to disambiguate multi-source runs.
+    cam{idx} for integers, file stems for files, 'stream' for URLs,
+    or a sanitized fallback.
+    """
+    if isinstance(src, int):
+        return f"cam{src}"
+    s = str(src)
+    p = Path(s)
+    if p.exists() and p.is_file():
+        return p.stem[:32]
+    if is_stream_url(s):
+        return "stream"
+    # fallback: sanitize arbitrary string
+    s = re.sub(r"[^A-Za-z0-9_-]+", "-", s)
+    return s[:32] if s else "src"
 
 
 # ---------------------------
@@ -136,7 +159,7 @@ class EdgeSampler:
         use_hash: bool = True,
         hash_hamming_thresh: int = 6,
         show: bool = False,
-        verbose: bool = False,  # ADDED: compact per-frame logging
+        verbose: bool = False,
     ):
         self.mode = mode
         self.source = source
@@ -147,7 +170,7 @@ class EdgeSampler:
         self.iou = float(iou)
         self.save_crops = bool(save_crops)
         self.show = bool(show)
-        self.verbose = bool(verbose)  # ADDED
+        self.verbose = bool(verbose)
 
         if mode == "cars":
             self.allowed_cls = {COCO_CLASS_MAP["car"]}
@@ -162,7 +185,7 @@ class EdgeSampler:
         self.cooldown = Cooldown(cooldown_s=cooldown_s)
         self.dupe = DuplicateSuppressor(max_keep=200, hamming_thresh=hash_hamming_thresh) if use_hash else None
 
-        # Model (Ultralytics decides device internally; no torch import)
+        # Model
         self.model = YOLO(self.weights)
 
         # Video source
@@ -171,6 +194,7 @@ class EdgeSampler:
             raise RuntimeError(f"Unable to open source: {self.source}")
 
         self.font = cv2.FONT_HERSHEY_SIMPLEX
+        self.src_tag = make_source_tag(self.source)
 
         # Detect if input is a file so we stop at EOF
         self._is_file = isinstance(self.source, str) and Path(self.source).exists() and not is_stream_url(self.source)
@@ -187,7 +211,7 @@ class EdgeSampler:
 
     def _draw_overlay(self, frame, fps=None):
         y = 24
-        cv2.putText(frame, f"Mode: {self.mode}", (10, y), self.font, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, f"Mode: {self.mode} ({self.src_tag})", (10, y), self.font, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
         y += 22
         if fps is not None:
             cv2.putText(frame, f"FPS: {fps:.1f}", (10, y), self.font, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
@@ -200,13 +224,16 @@ class EdgeSampler:
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = max(x1 + 1, x2), max(y1 + 1, y2)
             crop = frame_bgr[y1:y2, x1:x2]
-            path = outdir / f"{slug}_{self.tag}_crop.jpg"
+            path = outdir / f"{slug}_{self.tag}_{self.src_tag}_crop.jpg"
             cv2.imwrite(str(path), crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            return path  # CHANGED: return path for logging
         else:
-            path = outdir / f"{slug}_{self.tag}.jpg"
+            path = outdir / f"{slug}_{self.tag}_{self.src_tag}.jpg"
             cv2.imwrite(str(path), frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-            return path  # CHANGED: return path for logging
+
+        # Always print when an image is saved
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{ts} [saved] {path}")
+        return path
 
     def run(self):
         fps_smooth = None
@@ -225,14 +252,14 @@ class EdgeSampler:
                     self.cap = cv2.VideoCapture(self.source)
                     continue
 
-                # Inference (keep Ultralytics quiet; we print our own concise line)
+                # Inference
                 t0 = time.perf_counter()
                 results = self.model.predict(
                     source=frame,
                     imgsz=self.imgsz,
                     conf=self.conf,
                     iou=self.iou,
-                    verbose=False,  # CHANGED: no extra Ultralytics logs
+                    verbose=False,
                 )
                 infer_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -256,18 +283,17 @@ class EdgeSampler:
                                 any_saved = True
                                 break
 
-                # ADDED: one concise line per frame when --verbose
                 if self.verbose:
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     sp = str(saved_path) if saved_path else "-"
-                    print(f"{ts} | {infer_ms:.1f} ms | det={checked} | saved={sp}")
+                    print(f"{ts} | {self.src_tag} | {infer_ms:.1f} ms | det={checked} | saved={sp}")
 
                 if self.show:
                     fps = 1.0 / max(1e-6, (time.perf_counter() - t_prev))
                     fps_smooth = fps if fps_smooth is None else (0.9 * fps_smooth + 0.1 * fps)
                     t_prev = time.perf_counter()
                     self._draw_overlay(frame, fps=fps_smooth)
-                    cv2.imshow("edge_capture", frame)
+                    cv2.imshow(f"edge_capture:{self.src_tag}", frame)
                     if cv2.waitKey(1) & 0xFF == 27:
                         break
 
@@ -299,8 +325,8 @@ def parse_args():
         description="Edge data-gatherer for cars / people with cool-down, caps, and dedup (ultralytics-only)."
     )
     p.add_argument("--mode", choices=["cars", "people"], required=True)
-    p.add_argument("--source", required=True,
-                   help="Camera index (e.g., 0), RTSP/HTTP URL, or path to a video file.")
+    p.add_argument("--source", action="append", required=True,
+                   help="Repeatable. Camera index (e.g., 0), RTSP/HTTP URL, or path to a video file. Example: --source 0 --source 1")
     p.add_argument("--out", type=Path, required=True, help="Output base directory.")
     p.add_argument("--weights", default=DEFAULT_WEIGHTS, help="YOLOv8 weights (.pt).")
     p.add_argument("--imgsz", type=int, default=640, help="Inference image size.")
@@ -312,17 +338,17 @@ def parse_args():
     p.add_argument("--no-hash", action="store_true", help="Disable near-duplicate suppression.")
     p.add_argument("--hash-hamming-thresh", type=int, default=6, help="Lower = stricter duplicate filtering.")
     p.add_argument("--show", action="store_true", help="Preview window (desktop testing).")
-    p.add_argument("--verbose", action="store_true",
-                   help="Print per-frame timing, detections considered, and save path (no extra Ultralytics logs).")
+
+    # Verbose is ON by default; can be disabled with `--verbose false`
+    p.add_argument("--verbose", type=str2bool, default=True,
+                   help="Verbose logging (default: true). Pass '--verbose false' to disable.")
     return p.parse_args()
 
-
-def main():
-    args = parse_args()
-    src = normalize_source(args.source)
+def _run_one_sampler(args, src):
+    src_norm = normalize_source(src)
     sampler = EdgeSampler(
         mode=args.mode,
-        source=src,
+        source=src_norm,
         out_base=args.out,
         weights=args.weights,
         imgsz=args.imgsz,
@@ -337,6 +363,31 @@ def main():
         verbose=args.verbose,
     )
     sampler.run()
+
+def main():
+    args = parse_args()
+
+    # Single source → run in foreground (same behavior as before)
+    if len(args.source) == 1:
+        _run_one_sampler(args, args.source[0])
+        return
+
+    # Multi-source → spin up a thread per source
+    threads = []
+    for s in args.source:
+        t = threading.Thread(target=_run_one_sampler, args=(args, s), daemon=True)
+        t.start()
+        threads.append(t)
+        print(f"Started sampler for source: {s}")
+
+    # Wait until interrupted
+    try:
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        STOP_EVENT.set()
+        for t in threads:
+            t.join()
 
 
 if __name__ == "__main__":
